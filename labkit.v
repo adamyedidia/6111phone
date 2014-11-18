@@ -693,16 +693,16 @@ module labkit   (beep, audio_reset_b, ac97_sdata_out, ac97_sdata_in, ac97_synch,
 	assign user3[7:0] = led_value;
 
 	send_over_wire sow(.clock(clock_27mhz), .reset(reset), .ready(ready),
-//							 .crypto(8'b00000000), .from_ac97_data(from_ac97_data),
-							 .crypto(8'b00000000), .from_ac97_data(switch),
+							 .crypto(8'b00000000), .from_ac97_data(from_ac97_data),
+//							 .crypto(8'b00000000), .from_ac97_data(switch),
 							 .out(user1[0]), .data_ready(user1[1]), 
 							 .need_more_crypto(useless));
 							 
 	receive_from_wire row(.clock(clock_27mhz), .reset(reset),
 							.data_ready(user4[1]), .crypto(8'b0),
 							.data_over_wire(user4[0]), 
-//							.sounds_to_play(to_ac97_data));
-							.sounds_to_play(led_value));
+							.sounds_to_play(to_ac97_data));
+//							.sounds_to_play(led_value));
    // record module
 //   recorder r(.clock(clock_27mhz), .reset(reset), .ready(ready),
 //              .playback(playback), .filter(filter),
@@ -734,26 +734,86 @@ module receive_from_wire(
 	parameter NUM_BITS_FROM_AC97 = 8;
 	parameter LOG_NUM_BITS_FROM_AC97 = 3;
 	
+	parameter MAJORITY_SIZE = 3;
+	parameter NUM_SAMPLES = MAJORITY_SIZE*2 - 1;
+	parameter LOG_NUM_SAMPLES = 3;
+	
+	// this will look for the header indicating the end signal
+	reg [2:0] switches_seen_without_a_data_ready;
+	reg old_data_over_wire;
+	
 	reg [NUM_BITS_FROM_AC97-1:0] buffer;	
 	reg [LOG_NUM_BITS_FROM_AC97-1:0] buffer_index_counter;
 	
 	reg [2*LENGTH_DATA_READY_FOR_SATISFACTION-1:0] data_ready_history_buf;
 	
+//	reg [NUM_SAMPLES-1:0] sample_buffer;
+	
+	reg [LOG_NUM_SAMPLES-1:0] how_many_ones;
+	reg [LOG_NUM_SAMPLES-1:0] samples_so_far;
+	
+	reg state;
+	
+	parameter IDLE_STATE = 0;
+	parameter SAMPLING_STATE = 1;
+	
 	always @(posedge clock) begin
 		if (reset) begin
 			buffer <= 0;
 			buffer_index_counter <= 0;
+			state <= IDLE_STATE;
+			
+			how_many_ones <= 0;
 		end
 		
+		// checking if the 0->1 transition of the data_ready was clean; otherwise
+		// it's probably just noise.
 		else if ((&data_ready_history_buf[LENGTH_DATA_READY_FOR_SATISFACTION-1:0]) & 
 			(~(|data_ready_history_buf[2*LENGTH_DATA_READY_FOR_SATISFACTION-1:LENGTH_DATA_READY_FOR_SATISFACTION]))) begin
-			buffer[buffer_index_counter] <= data_over_wire;
-			buffer_index_counter <= buffer_index_counter + 1;
+			
+			state <= SAMPLING_STATE;
+						
+			samples_so_far <= 0;
+			how_many_ones <= 0;	
+			// prepare for sampling state
+					
+			switches_seen_without_a_data_ready <= 0;
+			// We just saw a data_ready, after all
 		end
+		
+		if (state == SAMPLING_STATE) begin
+		
+			// we've seen enough samples to finish
+			if (samples_so_far >= NUM_SAMPLES) begin
+				// If we've seen mostly 1's, put a 1
+				if (how_many_ones >= MAJORITY_SIZE)
+					buffer[buffer_index_counter] <= 1;
+				else
+					buffer[buffer_index_counter] <= 0;
+				
+				// increment buffer index counter
+				buffer_index_counter <= buffer_index_counter + 1;
+				
+				state <= IDLE_STATE;
+			end
+			
+			else begin
+				samples_so_far <= samples_so_far + 1;
+				how_many_ones <= how_many_ones + data_over_wire;
+			end
+		end
+		
+		if (old_data_over_wire == ~data_over_wire) 
+			switches_seen_without_a_data_ready <= switches_seen_without_a_data_ready + 1;
+			
+		// If we just saw an end signal, re-initialize
+		if (&switches_seen_without_a_data_ready) buffer_index_counter <= 0;
 		
 		if (buffer_index_counter == 0) sounds_to_play <= buffer;
 		
 		data_ready_history_buf <= {data_ready_history_buf[4:0], data_ready};
+		
+		old_data_over_wire <= data_over_wire;
 	end
 endmodule
 	
@@ -783,7 +843,9 @@ module send_over_wire(
 	parameter NUM_BITS_FROM_AC97 = 8;
 	parameter LOG_NUM_BITS_FROM_AC97 = 3;
 	
-	parameter LOG_NUM_CLOCK_CYCLES_WIRE_CLOCK_COUNTER = 6;
+	parameter LOG_NUM_CLOCK_CYCLES_WIRE_CLOCK_COUNTER = 4;
+	
+	parameter LOG_NUM_CLOCK_CYCLES_BEFORE_SENDING_BURST_SIGNAL = 5;
 	
 	reg [NUM_BITS_FROM_AC97-1:0] buffer;
 	
@@ -795,24 +857,43 @@ module send_over_wire(
 
 	reg [LOG_NUM_CLOCK_CYCLES_WIRE_CLOCK_COUNTER-1:0] wire_clock_counter;
 
-	reg old_data_ready;
+	reg [LOG_NUM_CLOCK_CYCLES_BEFORE_SENDING_BURST_SIGNAL-1:0] burst_wait_counter;
 
-	reg wait_for_more_data;
+	reg [3:0] state;
+	parameter SENDING_DATA_BITS_STATE = 0;
+	parameter SENDING_END_PACKET_SIGNAL_STATE = 1;
+	parameter WAITING_FOR_MORE_DATA_STATE = 2;
+
+	reg old_data_ready;
+	
+	
+	// This'll be always be 8'b01010101
+	reg [7:0] end_signal_buffer;
+	
+	reg [2:0] end_signal_buffer_index_counter;
 
 	always @(posedge clock) begin
 		if (reset) begin
+			state <= WAITING_FOR_MORE_DATA_STATE;
+			
+			end_signal_buffer <= 8'b10101010;
+		
 			wait_data_ready_counter <= 0;
 			buffer <= 0;
 			buffer_index_counter <= 0;
 			wait_data_ready_counter <= 0;
 			old_data_ready <= 0;
 			wire_clock_counter <= 0;
+			burst_wait_counter <= 0;
+			end_signal_buffer_index_counter <= 0;
 		end
 		
 		else if (ready) begin
+			end_signal_buffer <= 8'b10101010;
+			state <= SENDING_DATA_BITS_STATE;
+		
 			buffer <= from_ac97_data ^ crypto;
 			old_data_ready <= 1;
-			wait_for_more_data <= 0;
 			wire_clock_counter <= 0;
 		end
 		
@@ -825,24 +906,42 @@ module send_over_wire(
 			
 			wire_clock_counter <= wire_clock_counter + 1;
 			
-			if ((&wire_clock_counter) & (~wait_for_more_data)) begin
+			// LOGIC FOR SENDING_DATA_BITS_STATE FOLLOWS
+			
+			if ((&wire_clock_counter) & (state == SENDING_DATA_BITS_STATE)) begin
 				// increment buffer_index_counter; move onto next bit in buffer
 				
 				// if we've reached all the bits in the buffer, we need to stop
 				
 				buffer_index_counter <= buffer_index_counter + 1;
 				
-				if (&buffer_index_counter) wait_for_more_data <= 1;
+				
+				// We're done sending data bits if this is true
+				if (&buffer_index_counter) state <= SENDING_END_PACKET_SIGNAL_STATE;
+
 				
 				// We must not make the data_ready 1 if it's all 1's; that would be our ninth pulse.
 				if (~(&buffer_index_counter)) old_data_ready <= 1;
 			end		
+			
+			// LOGIC FOR SENDING_END_PACKET_SIGNAL_STATE FOLLOWS
+			
+			if ((&wire_clock_counter) & (state == SENDING_END_PACKET_SIGNAL_STATE)) begin
+				end_signal_buffer_index_counter <= end_signal_buffer_index_counter + 1;
+				
+				if (&end_signal_buffer_index_counter) state <= WAITING_FOR_MORE_DATA_STATE;
+				// note data ready not high in this state.
+			end
+			
+			// LOGIC	
+			
 		end	
 		
 		data_ready <= old_data_ready;
 	end
 	
-	assign out = buffer[buffer_index_counter];
+	assign out = (state == SENDING_DATA_BITS_STATE) ? 
+		buffer[buffer_index_counter] : end_signal_buffer[end_signal_buffer_index_counter];
 	assign need_more_crypto = (buffer_index_counter == NUM_BITS_FROM_AC97-1);
 endmodule
 
